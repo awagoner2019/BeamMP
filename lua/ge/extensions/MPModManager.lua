@@ -96,6 +96,67 @@ end
 
 local waitForFilesChanged = false
 
+-- Batch loading: while the launcher syncs the server mods, the game's auto-mount is held off so
+-- each zip isn't mounted (and every file-change listener fired) one at a time. Once the sync is
+-- done the mod manager's initDB mounts all of them in one pass, like it does on game startup.
+local batchLoading = false -- auto-mount is held off by us
+local batchMountPending = false -- waiting for initDB to finish
+local batchMountTimer = 0
+local batchMountTimeout = 60 -- seconds before falling back to one-by-one loading
+local loadGeneration = 0 -- bumped on every join/leave so stale jobs don't act on a newer session
+
+local function canBatchLoad()
+	if core_modmanager == nil or core_modmanager.disableAutoMount == nil or core_modmanager.enableAutoMount == nil or core_modmanager.getModDB == nil then
+		return false
+	end
+	-- initDB returns early without mounting anything while mods are disabled after a game update
+	if settings.getValue('disableModsAfterUpdate') then
+		return false
+	end
+	return true
+end
+
+local function isLoadCurrent(generation)
+	return generation == loadGeneration and (MPCoreNetwork.isMPSession() or MPCoreNetwork.isGoingMPSession())
+end
+
+-- Server mods that arrived while auto-mount was held aren't in the mod DB yet, so
+-- cleanUpSessionMods can't see them. Remove them before auto-mount would mount them.
+local function removeHeldSessionMods()
+	local count = 0
+	for _, path in ipairs(FS:findFiles("/mods/multiplayer", "*.zip", -1, false, false)) do
+		local modname = getModNameFromPath(path)
+		if modname ~= "multiplayerbeammp" and not core_modmanager.getModDB(modname) then
+			if FS:remove(path) == 0 then
+				count = count + 1
+			else
+				log('E', 'removeHeldSessionMods', 'Unable to delete ' .. path)
+			end
+		end
+	end
+	log('M', 'removeHeldSessionMods', count .. ' unloaded session mods removed')
+end
+
+local releaseDelay = 2 -- seconds to let a mod the launcher is still placing land before cleaning up
+local releaseTimer = nil
+
+local function releaseAutoMount()
+	releaseTimer = nil
+	if batchLoading then
+		batchLoading = false
+		removeHeldSessionMods()
+		log('M', 'releaseAutoMount', 'Restoring mod auto-mount')
+		core_modmanager.enableAutoMount()
+	end
+end
+
+--- Release auto-mount shortly after a leave, once the launcher has stopped placing files
+local function scheduleReleaseAutoMount()
+	if batchLoading and not releaseTimer then
+		releaseTimer = 0
+	end
+end
+
 --- Check the game mod list against BeamMP's expected
 local function checkAllMods() --add counters?
 	log('M', 'checkAllMods', 'Checking all mods...')
@@ -104,25 +165,73 @@ local function checkAllMods() --add counters?
 	end
 end
 
---- Load the Servers mods, these are put in by the BeamMP Launcher
-local function loadServerMods()
-	log('W', 'loadServerMods', 'loadServerMods')
-
+--- Load the Servers mods one at a time (original behaviour, used as fallback)
+local function loadServerModsOneByOne()
 	local modsDir = FS:findFiles("/mods/multiplayer", "*.zip", -1, false, false)
+	local generation = loadGeneration
 
     core_jobsystem.create(function(job)
 		local amount = #modsDir
         local batchSize = 5
 		local core_modmanager_workOffChangedMod = core_modmanager.workOffChangedMod
         for i = 1, amount, batchSize do
+            if not isLoadCurrent(generation) then return end
             for j = i, math.min(i + batchSize - 1, amount) do
                 core_modmanager_workOffChangedMod(modsDir[j], 'added')
             end
             job.sleep(0)
         end
+        if not isLoadCurrent(generation) then return end
         checkAllMods()
         MPCoreNetwork.requestMap()
     end)
+end
+
+--- Load the Servers mods, these are put in by the BeamMP Launcher
+local function loadServerMods()
+	log('W', 'loadServerMods', 'loadServerMods')
+	if batchLoading then
+		batchLoading = false
+		batchMountPending = true
+		batchMountTimer = 0
+		log('M', 'loadServerMods', 'Mounting all server mods in one batch')
+		core_modmanager.enableAutoMount() -- runs initDB, which mounts every new mod in one pass
+		return
+	end
+	loadServerModsOneByOne()
+end
+
+--- Returns the mod DB entries of all server mods, or nil if any of them isn't mounted and active
+local function getMountedServerMods()
+	local result = {}
+	for _, modname in ipairs(serverMods) do
+		local mod = core_modmanager.getModDB(modname)
+		if not mod or not mod.active or not mod.fullpath or not FS:isMounted(mod.fullpath) then
+			log('W', 'getMountedServerMods', 'Server mod not mounted after batch: ' .. tostring(modname))
+			return nil
+		end
+		table.insert(result, mod)
+	end
+	return result
+end
+
+--- A BeamNG event that is called when the mod manager finished (re)mounting all mods
+local function onModManagerModsMounted()
+	if not batchMountPending then return end
+	batchMountPending = false
+	local mounted = getMountedServerMods()
+	if not mounted then
+		log('W', 'onModManagerModsMounted', 'Batch mount incomplete, loading server mods one by one')
+		loadServerModsOneByOne()
+		return
+	end
+	log('M', 'onModManagerModsMounted', 'Batch mount done')
+	-- initDB doesn't fire this per mod like activateMod does, so listeners still get it
+	for _, mod in ipairs(mounted) do
+		extensions.hook('onModActivated', deepcopy(mod))
+	end
+	checkAllMods()
+	MPCoreNetwork.requestMap()
 end
 
 --- Verify that the servers mods have been loaded by the game.
@@ -185,6 +294,16 @@ local function setServerMods(modsString)
 	end
 	serverMods = mods
 	guihooks.trigger("onBeamMPServerModsChanged", serverModDisplayNames)
+	loadGeneration = loadGeneration + 1
+	if releaseTimer then
+		releaseTimer = nil -- joining again before the delayed release: keep holding auto-mount
+		log('M', 'setServerMods', 'Keeping mod auto-mount held for the new session')
+	end
+	if canBatchLoad() and not batchLoading and not batchMountPending then
+		batchLoading = true
+		core_modmanager.disableAutoMount()
+		log('M', 'setServerMods', 'Holding mod auto-mount until all server mods are synced')
+	end
 end
 
 local function getServerMods()
@@ -284,6 +403,7 @@ end
 local function onExtensionUnloaded() -- restore functions back to their default values
 	--registerCoreModule = original_registerCoreModule and original_registerCoreModule
 	if core_repository then core_repository.modUnsubscribe = original_Unsubscribe and original_Unsubscribe end
+	releaseAutoMount() -- don't leave the game's mod auto-mount off if we're unloaded mid-sync
 end
 
 --- This is used to ensure the cleanup of the mods from the mod manager is done at the end of the session.
@@ -295,6 +415,9 @@ local function onServerLeave()
 		guihooks.trigger("onBeamMPServerModsChanged", serverModDisplayNames)
 		cleanUpSessionMods() -- removes any leftover session mods
 	end
+	loadGeneration = loadGeneration + 1
+	batchMountPending = false
+	scheduleReleaseAutoMount()
 end
 
 local requestLuaReload = false
@@ -310,6 +433,24 @@ local reloadTimer = 0
 --- onUpdate is a game eventloop function. It is called each frame by the game engine.
 -- @param dt float
 local function onUpdate(dt)
+	if batchLoading and not releaseTimer and not MPCoreNetwork.isMPSession() and not MPCoreNetwork.isGoingMPSession() then
+		log('W', 'onUpdate', 'Session ended during mod sync, restoring mod auto-mount')
+		scheduleReleaseAutoMount()
+	end
+	if releaseTimer then
+		releaseTimer = releaseTimer + dt
+		if releaseTimer >= releaseDelay then
+			releaseAutoMount()
+		end
+	end
+	if batchMountPending then
+		batchMountTimer = batchMountTimer + dt
+		if batchMountTimer >= batchMountTimeout then
+			batchMountPending = false
+			log('W', 'onUpdate', 'Batch mount did not finish, loading server mods one by one')
+			loadServerModsOneByOne()
+		end
+	end
 	if requestLuaReload then
 		reloadTimer = reloadTimer + dt
 		if reloadTimer >= 0.5 then Lua:requestReload() end
@@ -330,6 +471,7 @@ M.verifyMods = verifyMods
 M.onExtensionLoaded = onExtensionLoaded
 M.onExtensionUnloaded = onExtensionUnloaded
 M.onModActivated = onModActivated
+M.onModManagerModsMounted = onModManagerModsMounted
 M.onBeamMPServerLeave = onServerLeave
 M.onExit = cleanUpSessionMods
 M.onUpdate = onUpdate
